@@ -2,7 +2,7 @@ import { createLogger } from '@archon/paths';
 import { execSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 
-const OPENCODE_START_TIMEOUT_MS = 5000;
+const OPENCODE_START_TIMEOUT_MS = 30000;
 const OPENCODE_START_MAX_RETRIES = 3;
 
 function generateRandomPassword(): string {
