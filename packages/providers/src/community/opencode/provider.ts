@@ -172,6 +172,11 @@ export class OpencodeProvider implements IAgentProvider {
         resumedOutcome(resumeSessionId, resumed)
       );
     } finally {
+      // OpenCode 1.18.34 can close the event stream just before the embedded
+      // server finishes persisting the turn. Releasing the runtime in that
+      // window races the server and the CLI is killed. A short settle delay
+      // lets the server finish; it costs two seconds per node, not per token.
+      await new Promise(resolve => setTimeout(resolve, 2000));
       releaseEmbeddedRuntime(embedded);
     }
   }

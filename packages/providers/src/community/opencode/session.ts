@@ -1,4 +1,6 @@
 import { createLogger } from '@archon/paths';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   sessionPreview,
@@ -231,6 +233,7 @@ export async function* streamOpencodeSession(
   const seenToolCalls = new Set<string>();
   const completedToolCalls = new Set<string>();
   const textBlocks = new TextPartBlocks();
+  const userMessageIds = new Set<string>();
   let latestAssistantInfo: Record<string, unknown> | undefined;
   let lastAssistantMessageId: string | undefined;
   let aborted = requestOptions?.abortSignal?.aborted === true;
@@ -265,9 +268,11 @@ export async function* streamOpencodeSession(
 
       if (event.type === 'message.updated') {
         const info = isRecord(properties.info) ? properties.info : undefined;
-        if (info?.role === 'assistant' && info.sessionID === sessionId) {
-          latestAssistantInfo = info;
-          if (typeof info.id === 'string') {
+        if (info?.sessionID === sessionId && typeof info.id === 'string') {
+          if (info.role === 'user') {
+            userMessageIds.add(info.id);
+          } else if (info.role === 'assistant') {
+            latestAssistantInfo = info;
             lastAssistantMessageId = info.id;
           }
         }
@@ -277,6 +282,12 @@ export async function* streamOpencodeSession(
       if (event.type === 'message.part.updated') {
         const part = isRecord(properties.part) ? properties.part : undefined;
         if (!part || part?.sessionID !== sessionId || typeof part.type !== 'string') {
+          continue;
+        }
+
+        // OpenCode emits part updates for the user message too. Reporting one
+        // as assistant text duplicates the whole command in the node output.
+        if (typeof part.messageID === 'string' && userMessageIds.has(part.messageID)) {
           continue;
         }
 
@@ -321,6 +332,31 @@ export async function* streamOpencodeSession(
         const eventSessionId =
           typeof properties.sessionID === 'string' ? properties.sessionID : undefined;
         if (eventSessionId && eventSessionId !== sessionId) continue;
+
+        // The factory writes its reports under the engine's artifacts root,
+        // outside the checkout. The embedded runtime's config leaves
+        // external_directory on `ask`, which an unattended node cannot answer.
+        // Approve only that trusted root and the doom-loop guard; every other
+        // permission still fails fast.
+        const permission =
+          typeof properties.permission === 'string' ? properties.permission : '';
+        const patterns = Array.isArray(properties.patterns)
+          ? properties.patterns.filter((value): value is string => typeof value === 'string')
+          : [];
+        const artifactsRoot = join(homedir(), '.archon', 'workspaces');
+        const trusted =
+          permission === 'doom_loop' ||
+          (permission === 'external_directory' &&
+            patterns.length > 0 &&
+            patterns.every(pattern => pattern.startsWith(artifactsRoot)));
+        if (trusted && typeof properties.id === 'string') {
+          await client.postSessionIdPermissionsPermissionId({
+            path: { id: sessionId, permissionID: properties.id },
+            query: { directory: cwd },
+            body: { response: 'once' },
+          });
+          continue;
+        }
 
         throw pendingPermissionError(properties);
       }

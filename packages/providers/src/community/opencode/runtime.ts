@@ -72,6 +72,7 @@ async function startEmbeddedOpencode(
 }
 
 export interface OpencodeClientLike {
+  postSessionIdPermissionsPermissionId(options: Record<string, unknown>): Promise<unknown>;
   session: {
     create(options?: Record<string, unknown>): Promise<{ data?: { id?: string } }>;
     get(options: Record<string, unknown>): Promise<{ data?: { id?: string } }>;
