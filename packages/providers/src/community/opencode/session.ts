@@ -112,6 +112,30 @@ export function toolPartEvents(
   return events;
 }
 
+function parseStructuredOutput(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  const unfenced = trimmed
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '')
+    .trim();
+  try {
+    return JSON.parse(unfenced);
+  } catch {
+    // A title or a prose preamble may precede the payload; keep the last object.
+    const start = unfenced.lastIndexOf('{');
+    const end = unfenced.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(unfenced.slice(start, end + 1));
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  }
+}
+
 /** OpenCode's `finish` reason in ACP's names; `undefined` for one ACP has no name for. */
 function opencodeStopReason(finish: unknown): ProviderStopReason | undefined {
   if (finish === 'stop') return 'end_turn';
@@ -161,7 +185,14 @@ export function createSessionPromptBody(
 ): Record<string, unknown> {
   const singleAgent = agentOverride ?? selectSingleAgent(requestOptions?.nodeConfig?.agents);
   const adaptedAgentConfig = singleAgent ? adaptNamedAgentForOpencode(singleAgent) : undefined;
-  const effectivePrompt = resolvePromptForAgent(singleAgent, prompt);
+  const basePrompt = resolvePromptForAgent(singleAgent, prompt);
+  // DeepSeek's thinking mode rejects the tool_choice that OpenCode derives from
+  // `format: json_schema`. Best-effort keeps the schema in the prompt; the
+  // executor validates the text and reasks on error.
+  const effectivePrompt =
+    requestOptions?.outputFormat?.type === 'json_schema'
+      ? `${basePrompt}\n\n--- STRUCTURED OUTPUT ---\nReply with ONLY a JSON object that validates against this JSON Schema. No prose, no code fences.\n${JSON.stringify(requestOptions.outputFormat.schema)}`
+      : basePrompt;
   const promptBody: Record<string, unknown> = {
     parts: [{ type: 'text', text: effectivePrompt }],
     model: adaptedAgentConfig?.model ?? model,
@@ -169,13 +200,6 @@ export function createSessionPromptBody(
     ...(adaptedAgentConfig?.tools ? { tools: adaptedAgentConfig.tools } : {}),
     ...(requestOptions?.systemPrompt ? { system: requestOptions.systemPrompt } : {}),
   };
-
-  if (requestOptions?.outputFormat?.type === 'json_schema') {
-    promptBody.format = {
-      type: 'json_schema',
-      schema: requestOptions.outputFormat.schema,
-    };
-  }
 
   return promptBody;
 }
@@ -193,33 +217,6 @@ export async function promptSession(
   });
 }
 
-async function readStructuredOutput(
-  client: OpencodeClientLike,
-  cwd: string,
-  sessionId: string,
-  messageId: string | undefined
-): Promise<unknown> {
-  if (!messageId) return undefined;
-
-  try {
-    const response = await client.session.message({
-      path: { id: sessionId, messageID: messageId },
-      query: { directory: cwd },
-    });
-    const info = response.data?.info;
-    if (isRecord(info) && 'structured_output' in info) {
-      return info.structured_output;
-    }
-  } catch (error) {
-    getLog().warn(
-      { err: error, sessionIdPreview: sessionPreview(sessionId), messageId },
-      'opencode.structured_output_lookup_failed'
-    );
-  }
-
-  return undefined;
-}
-
 export async function* streamOpencodeSession(
   client: OpencodeClientLike,
   cwd: string,
@@ -233,6 +230,7 @@ export async function* streamOpencodeSession(
   const seenToolCalls = new Set<string>();
   const completedToolCalls = new Set<string>();
   const textBlocks = new TextPartBlocks();
+  let assistantText = '';
   const userMessageIds = new Set<string>();
   let latestAssistantInfo: Record<string, unknown> | undefined;
   let lastAssistantMessageId: string | undefined;
@@ -294,7 +292,10 @@ export async function* streamOpencodeSession(
         if (part.type === 'text' || part.type === 'reasoning') {
           const delta = typeof properties.delta === 'string' ? properties.delta : undefined;
           const block = textBlocks.update(part, delta);
-          if (block) yield block;
+          if (block) {
+            if (block.type === 'agent_message_chunk') assistantText += block.text;
+            yield block;
+          }
           continue;
         }
 
@@ -364,23 +365,23 @@ export async function* streamOpencodeSession(
       if (event.type === 'session.idle') {
         if (properties.sessionID !== sessionId) continue;
 
-        // Only a node that declared a schema needs the extra lookup. Fetching
-        // the last message on every turn can hang when it belongs to a sibling
-        // agent (the title generator) in the same session.
+        const tokens = normalizeTokens(latestAssistantInfo);
         const structuredOutput =
           requestOptions?.outputFormat?.type === 'json_schema'
-            ? await readStructuredOutput(client, cwd, sessionId, lastAssistantMessageId)
+            ? parseStructuredOutput(assistantText)
             : undefined;
-        const tokens = normalizeTokens(latestAssistantInfo);
 
-        yield* textBlocks.drain();
+        for (const block of textBlocks.drain()) {
+          if (block.type === 'agent_message_chunk') assistantText += block.text;
+          yield block;
+        }
         // Built by assignment on a typed value so a misspelled key fails to compile.
         const result: ResultChunk = { type: 'result', sessionId };
         if (tokens) result.tokens = tokens;
-        if (structuredOutput !== undefined) result.structuredOutput = structuredOutput;
         if (typeof latestAssistantInfo?.cost === 'number') result.cost = latestAssistantInfo.cost;
         const stopReason = opencodeStopReason(latestAssistantInfo?.finish);
         if (stopReason !== undefined) result.stopReason = stopReason;
+        if (structuredOutput !== undefined) result.structuredOutput = structuredOutput;
         if (typeof latestAssistantInfo?.modelID === 'string' && latestAssistantInfo.modelID) {
           result.resolvedModel = { id: latestAssistantInfo.modelID };
         }

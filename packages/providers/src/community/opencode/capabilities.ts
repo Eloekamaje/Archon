@@ -31,7 +31,7 @@ export const OPENCODE_CAPABILITIES: ProviderCapabilities = {
   plugins: false,
   agents: true,
   toolRestrictions: true,
-  structuredOutput: 'enforced', // sends format:{json_schema}; reads info.structured_output
+  structuredOutput: 'best-effort', // schema appended to the prompt; DeepSeek thinking rejects tool_choice
   requiresAllPropertiesRequired: false, // OpenCode does not enforce the required-coverage rule
   envInjection: true,
   costControl: false,
