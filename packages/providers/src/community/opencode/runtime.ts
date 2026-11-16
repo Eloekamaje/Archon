@@ -128,7 +128,10 @@ function findProcessByPort(port: number): number | undefined {
       const pid = parseInt(result, 10);
       return pid && !isNaN(pid) ? pid : undefined;
     } else {
-      const result = execSync(`lsof -ti:${port} 2>/dev/null || fuser ${port}/tcp 2>/dev/null`, {
+      // Only the process LISTENING on the port. A plain `lsof -ti:PORT` also
+      // returns every client connected to it, including this CLI; taking the
+      // first PID then SIGKILLs the Archon process itself (exit 137).
+      const result = execSync(`lsof -ti:${port} -sTCP:LISTEN 2>/dev/null`, {
         encoding: 'utf8',
         timeout: 5000,
         shell: '/bin/sh',

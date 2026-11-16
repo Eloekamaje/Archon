@@ -364,12 +364,13 @@ export async function* streamOpencodeSession(
       if (event.type === 'session.idle') {
         if (properties.sessionID !== sessionId) continue;
 
-        const structuredOutput = await readStructuredOutput(
-          client,
-          cwd,
-          sessionId,
-          lastAssistantMessageId
-        );
+        // Only a node that declared a schema needs the extra lookup. Fetching
+        // the last message on every turn can hang when it belongs to a sibling
+        // agent (the title generator) in the same session.
+        const structuredOutput =
+          requestOptions?.outputFormat?.type === 'json_schema'
+            ? await readStructuredOutput(client, cwd, sessionId, lastAssistantMessageId)
+            : undefined;
         const tokens = normalizeTokens(latestAssistantInfo);
 
         yield* textBlocks.drain();
