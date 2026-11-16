@@ -32,6 +32,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+function envPositiveInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const value = Number.parseInt(raw, 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 type TextBlock = Extract<MessageChunk, { type: 'agent_message_chunk' | 'agent_thought_chunk' }>;
 
 /**
@@ -229,12 +236,17 @@ export async function* streamOpencodeSession(
   const streamController = new AbortController();
   const seenToolCalls = new Set<string>();
   const completedToolCalls = new Set<string>();
-  const textBlocks = new TextPartBlocks();
+  let textBlocks = new TextPartBlocks();
   let assistantText = '';
   const userMessageIds = new Set<string>();
   let latestAssistantInfo: Record<string, unknown> | undefined;
   let lastAssistantMessageId: string | undefined;
   let aborted = requestOptions?.abortSignal?.aborted === true;
+  const structuredRequired = requestOptions?.outputFormat?.type === 'json_schema';
+  const maxToolCalls = envPositiveInt('OPENCODE_MAX_TOOL_CALLS', 200);
+  const maxRepairs = envPositiveInt('OPENCODE_STRUCTURED_REPAIRS', 2);
+  let toolCalls = 0;
+  let repairAttempts = 0;
 
   const abortHandler = (): void => {
     aborted = true;
@@ -300,7 +312,19 @@ export async function* streamOpencodeSession(
         }
 
         if (part.type === 'tool' && typeof part.callID === 'string') {
-          yield* toolPartEvents(part, part.callID, seenToolCalls, completedToolCalls);
+          for (const chunk of toolPartEvents(
+            part,
+            part.callID,
+            seenToolCalls,
+            completedToolCalls
+          )) {
+            if (chunk.type === 'tool_call' && ++toolCalls > maxToolCalls) {
+              throw new Error(
+                `OpenCode turn exceeded the ${maxToolCalls}-tool-call budget without idling; the agent is looping.`
+              );
+            }
+            yield chunk;
+          }
         }
         continue;
       }
@@ -369,14 +393,37 @@ export async function* streamOpencodeSession(
         if (properties.sessionID !== sessionId) continue;
 
         const tokens = normalizeTokens(latestAssistantInfo);
-        const structuredOutput =
-          requestOptions?.outputFormat?.type === 'json_schema'
-            ? parseStructuredOutput(assistantText)
-            : undefined;
-
+        // Open parts hold the model's latest words. Drain them before parsing so a
+        // final JSON block that OpenCode did not mark finished still reaches the
+        // structured-output parser instead of arriving only after the verdict.
         for (const block of textBlocks.drain()) {
           if (block.type === 'agent_message_chunk') assistantText += block.text;
           yield block;
+        }
+        const structuredOutput = structuredRequired
+          ? parseStructuredOutput(assistantText)
+          : undefined;
+
+        if (structuredRequired && structuredOutput === undefined) {
+          if (repairAttempts < maxRepairs) {
+            repairAttempts += 1;
+            assistantText = '';
+            textBlocks = new TextPartBlocks();
+            await promptSession(
+              client,
+              cwd,
+              sessionId,
+              createSessionPromptBody(
+                'Your previous answer did not include the required JSON object. Do not call any tools. Return the final result now.',
+                model,
+                requestOptions
+              )
+            );
+            continue;
+          }
+          throw new Error(
+            `OpenCode did not return the required structured output after ${repairAttempts} repair attempt(s).`
+          );
         }
         // Built by assignment on a typed value so a misspelled key fails to compile.
         const result: ResultChunk = { type: 'result', sessionId };

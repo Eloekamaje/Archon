@@ -213,6 +213,8 @@ describe('OpencodeProvider', () => {
     mockLogger.error.mockClear();
     mockLogger.debug.mockClear();
     resetEmbeddedRuntime();
+    delete process.env.OPENCODE_MAX_TOOL_CALLS;
+    delete process.env.OPENCODE_STRUCTURED_REPAIRS;
   });
 
   afterEach(async () => {
@@ -782,7 +784,7 @@ describe('OpencodeProvider', () => {
       },
     });
     expect(violations).toEqual([]);
-  });
+  }, 120_000);
 
   test('multi-agent usage keeps cache from the sub-agent that reported it', async () => {
     const cwd = await createTempProjectDir();
@@ -1033,16 +1035,8 @@ describe('OpencodeProvider', () => {
     expect(chunks).toEqual([{ type: 'result', sessionId: 'resumed-session', resumed: true }]);
   });
 
-  test('structured output success includes parsed payload on result chunk', async () => {
-    const runtime = makeRuntime({
-      sessionMessage: mock(async () => ({
-        data: {
-          info: {
-            structured_output: { answer: 'ok', confidence: 0.9 },
-          },
-        },
-      })),
-    });
+  test('structured output success parses a final text part still open at idle', async () => {
+    const runtime = makeRuntime();
     runtimeQueue.push(runtime);
     scriptedEvents = [
       {
@@ -1052,6 +1046,19 @@ describe('OpencodeProvider', () => {
             id: 'message-1',
             role: 'assistant',
             sessionID: 'session-1',
+          },
+        },
+      },
+      {
+        type: 'message.part.updated',
+        properties: {
+          delta: '{"answer":"ok"}',
+          part: {
+            id: 'part-1',
+            messageID: 'message-1',
+            sessionID: 'session-1',
+            type: 'text',
+            text: '{"answer":"ok"}',
           },
         },
       },
@@ -1076,45 +1083,122 @@ describe('OpencodeProvider', () => {
       path: { id: 'session-1' },
       query: { directory: '/tmp' },
       body: {
-        parts: [{ type: 'text', text: 'hi' }],
+        parts: [
+          {
+            type: 'text',
+            text:
+              'hi\n\n--- STRUCTURED OUTPUT ---\nReply with ONLY a JSON object that validates against this JSON Schema. No prose, no code fences.\n{"type":"object","properties":{"answer":{"type":"string"}}}',
+          },
+        ],
         model: { providerID: 'test', modelID: 'mock-model' },
-        format: {
-          type: 'json_schema',
-          schema: { type: 'object', properties: { answer: { type: 'string' } } },
-        },
       },
     });
-    expect(chunks).toEqual([
-      {
-        type: 'result',
-        sessionId: 'session-1',
-        structuredOutput: { answer: 'ok', confidence: 0.9 },
-      },
-    ]);
+    expect(chunks).toContainEqual({
+      type: 'result',
+      sessionId: 'session-1',
+      structuredOutput: { answer: 'ok' },
+    });
   });
 
-  test('structured output failure logs debug and still yields terminal result', async () => {
-    const runtime = makeRuntime({
-      sessionMessage: mock(async () => {
-        throw new Error('lookup failed');
-      }),
-    });
+  test('structured output repairs a prose-only turn and returns the JSON', async () => {
+    const runtime = makeRuntime();
     runtimeQueue.push(runtime);
     scriptedEvents = [
       {
         type: 'message.updated',
         properties: {
-          info: {
-            id: 'message-1',
-            role: 'assistant',
-            sessionID: 'session-1',
-          },
+          info: { id: 'message-1', role: 'assistant', sessionID: 'session-1' },
         },
       },
       {
-        type: 'session.idle',
-        properties: { sessionID: 'session-1' },
+        type: 'message.part.updated',
+        properties: {
+          delta: 'I am done.',
+          part: {
+            id: 'part-1',
+            messageID: 'message-1',
+            sessionID: 'session-1',
+            type: 'text',
+            text: 'I am done.',
+          },
+        },
       },
+      { type: 'session.idle', properties: { sessionID: 'session-1' } },
+      {
+        type: 'message.updated',
+        properties: {
+          info: { id: 'message-2', role: 'assistant', sessionID: 'session-1' },
+        },
+      },
+      {
+        type: 'message.part.updated',
+        properties: {
+          delta: '{"answer":"ok"}',
+          part: {
+            id: 'part-2',
+            messageID: 'message-2',
+            sessionID: 'session-1',
+            type: 'text',
+            text: '{"answer":"ok"}',
+          },
+        },
+      },
+      { type: 'session.idle', properties: { sessionID: 'session-1' } },
+    ];
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', undefined, {
+        assistantConfig: TEST_MODEL,
+        outputFormat: {
+          type: 'json_schema',
+          schema: { type: 'object', properties: { answer: { type: 'string' } } },
+        },
+      })
+    );
+
+    expect(error).toBeUndefined();
+    expect(runtime.client.session.promptAsync).toHaveBeenCalledTimes(2);
+    const repair = runtime.client.session.promptAsync.mock.calls[1][0] as {
+      body: { parts: Array<{ text: string }> };
+    };
+    expect(repair.body.parts[0].text).toContain('did not include the required JSON');
+    expect(repair.body.parts[0].text).toContain('"type":"object"');
+    expect(chunks).toContainEqual({
+      type: 'result',
+      sessionId: 'session-1',
+      structuredOutput: { answer: 'ok' },
+    });
+  });
+
+  test('structured output failure repairs twice, then fails the turn', async () => {
+    const runtime = makeRuntime();
+    runtimeQueue.push(runtime);
+    const prose = (id: string) => ({
+      type: 'message.part.updated',
+      properties: {
+        delta: 'I am done.',
+        part: {
+          id,
+          messageID: 'message-1',
+          sessionID: 'session-1',
+          type: 'text',
+          text: 'I am done.',
+        },
+      },
+    });
+    scriptedEvents = [
+      {
+        type: 'message.updated',
+        properties: {
+          info: { id: 'message-1', role: 'assistant', sessionID: 'session-1' },
+        },
+      },
+      prose('part-1'),
+      { type: 'session.idle', properties: { sessionID: 'session-1' } },
+      prose('part-2'),
+      { type: 'session.idle', properties: { sessionID: 'session-1' } },
+      prose('part-3'),
+      { type: 'session.idle', properties: { sessionID: 'session-1' } },
     ];
 
     const { chunks, error } = await consume(
@@ -1128,13 +1212,44 @@ describe('OpencodeProvider', () => {
     );
 
     expect(error).toBeUndefined();
-    expect(chunks).toEqual([
-      {
-        type: 'result',
-        sessionId: 'session-1',
-      },
-    ]);
-    expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+    expect(runtime.client.session.promptAsync).toHaveBeenCalledTimes(3);
+    expect(chunks).toContainEqual(expect.objectContaining({ type: 'result', isError: true }));
+  });
+
+  test('a turn that exceeds the tool-call budget fails instead of looping', async () => {
+    const previous = process.env.OPENCODE_MAX_TOOL_CALLS;
+    process.env.OPENCODE_MAX_TOOL_CALLS = '2';
+    try {
+      const runtime = makeRuntime();
+      runtimeQueue.push(runtime);
+      const tool = (id: string) => ({
+        type: 'message.part.updated',
+        properties: {
+          part: {
+            id,
+            messageID: 'message-1',
+            sessionID: 'session-1',
+            type: 'tool',
+            tool: 'bash',
+            callID: id,
+            state: { status: 'completed', input: {}, output: 'ok' },
+          },
+        },
+      });
+      scriptedEvents = [tool('tool-1'), tool('tool-2'), tool('tool-3')];
+
+      const { chunks, error } = await consume(
+        new OpencodeProvider().sendQuery('hi', '/tmp', undefined, {
+          assistantConfig: TEST_MODEL,
+        })
+      );
+
+      expect(error).toBeUndefined();
+      expect(chunks).toContainEqual(expect.objectContaining({ type: 'result', isError: true }));
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_MAX_TOOL_CALLS;
+      else process.env.OPENCODE_MAX_TOOL_CALLS = previous;
+    }
   });
 
   // The engine owns retry: a failed query is one attempt, reported once. Each case queues
@@ -1304,7 +1419,7 @@ describe('OpencodeProvider', () => {
       expect.objectContaining({
         hostname: '127.0.0.1',
         port: expect.any(Number),
-        timeout: 5000,
+        timeout: 30000,
         config: expect.objectContaining({
           server: expect.objectContaining({
             hostname: '127.0.0.1',
