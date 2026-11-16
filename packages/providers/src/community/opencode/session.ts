@@ -345,11 +345,14 @@ export async function* streamOpencodeSession(
           ? properties.patterns.filter((value): value is string => typeof value === 'string')
           : [];
         const artifactsRoot = join(homedir(), '.archon', 'workspaces');
+        const scratchRoot = '/tmp/opencode';
         const trusted =
           permission === 'doom_loop' ||
           (permission === 'external_directory' &&
             patterns.length > 0 &&
-            patterns.every(pattern => pattern.startsWith(artifactsRoot)));
+            patterns.every(
+              pattern => pattern.startsWith(artifactsRoot) || pattern.startsWith(scratchRoot)
+            ));
         if (trusted && typeof properties.id === 'string') {
           await client.postSessionIdPermissionsPermissionId({
             path: { id: sessionId, permissionID: properties.id },
