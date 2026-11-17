@@ -153,6 +153,8 @@ The node after this one publishes the complete report to the recorded pull reque
 
 ## Verify before finishing
 
+Do not run the project's full test suite or a broad CI command from this node. CI is a coverage item deferred to the workflow's CI step; the lenses' evidence and the smallest falsifying command are enough.
+
 Confirm both report files, this round's lens copies and `findings.json` exist, that `findings.json` parses and holds one record per finding in the report with the same IDs and `sources`, every accepted finding has `sources` and evidence you checked, every prior finding is accounted for in continuation mode, and every contract item in scope.md has a coverage row and every unmet one names its finding. Then declare:
 
 - `ready`: the verdict above.
