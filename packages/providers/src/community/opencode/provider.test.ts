@@ -215,6 +215,7 @@ describe('OpencodeProvider', () => {
     resetEmbeddedRuntime();
     delete process.env.OPENCODE_MAX_TOOL_CALLS;
     delete process.env.OPENCODE_STRUCTURED_REPAIRS;
+    delete process.env.OPENCODE_TURN_TIMEOUT_MS;
   });
 
   afterEach(async () => {
@@ -1249,6 +1250,30 @@ describe('OpencodeProvider', () => {
     } finally {
       if (previous === undefined) delete process.env.OPENCODE_MAX_TOOL_CALLS;
       else process.env.OPENCODE_MAX_TOOL_CALLS = previous;
+    }
+  });
+
+  test('a turn that never yields is aborted at the turn deadline', async () => {
+    const previous = process.env.OPENCODE_TURN_TIMEOUT_MS;
+    process.env.OPENCODE_TURN_TIMEOUT_MS = '50';
+    try {
+      const runtime = makeRuntime({
+        subscribe: mock(async () => ({ stream: createPendingStream() })),
+      });
+      runtimeQueue.push(runtime);
+
+      const { chunks, error } = await consume(
+        new OpencodeProvider().sendQuery('hi', '/tmp', undefined, {
+          assistantConfig: TEST_MODEL,
+        })
+      );
+
+      expect(error).toBeUndefined();
+      expect(chunks).toContainEqual(expect.objectContaining({ type: 'result', isError: true }));
+      expect(runtime.client.session.abort).toHaveBeenCalledTimes(1);
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_TURN_TIMEOUT_MS;
+      else process.env.OPENCODE_TURN_TIMEOUT_MS = previous;
     }
   });
 

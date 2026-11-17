@@ -242,14 +242,15 @@ export async function* streamOpencodeSession(
   let latestAssistantInfo: Record<string, unknown> | undefined;
   let lastAssistantMessageId: string | undefined;
   let aborted = requestOptions?.abortSignal?.aborted === true;
+  let timedOut = false;
   const structuredRequired = requestOptions?.outputFormat?.type === 'json_schema';
   const maxToolCalls = envPositiveInt('OPENCODE_MAX_TOOL_CALLS', 200);
   const maxRepairs = envPositiveInt('OPENCODE_STRUCTURED_REPAIRS', 2);
+  const turnTimeoutMs = envPositiveInt('OPENCODE_TURN_TIMEOUT_MS', 30 * 60 * 1000);
   let toolCalls = 0;
   let repairAttempts = 0;
 
-  const abortHandler = (): void => {
-    aborted = true;
+  const abortSession = (): void => {
     void client.session
       .abort({ path: { id: sessionId }, query: { directory: cwd } })
       .catch((error): void => {
@@ -258,12 +259,26 @@ export async function* streamOpencodeSession(
           'opencode.session_abort_failed'
         );
       });
+  };
+
+  const abortHandler = (): void => {
+    aborted = true;
+    abortSession();
     streamController.abort();
   };
 
   requestOptions?.abortSignal?.addEventListener('abort', abortHandler, {
     once: true,
   });
+
+  // A single tool call can hang (a test suite that never returns, a server that
+  // never answers); the tool-call budget counts calls, not their duration. Cut the
+  // turn so the run fails with a clear deadline instead of waiting forever.
+  const deadlineTimer = setTimeout(() => {
+    timedOut = true;
+    abortSession();
+    streamController.abort();
+  }, turnTimeoutMs);
 
   try {
     const promptBody = createSessionPromptBody(prompt, model, requestOptions);
@@ -440,6 +455,12 @@ export async function* streamOpencodeSession(
       }
     }
 
+    if (timedOut) {
+      throw new Error(
+        `OpenCode turn exceeded its ${turnTimeoutMs}ms deadline and was aborted (session: ${sessionPreview(sessionId)}, cwd: ${cwd})`
+      );
+    }
+
     if (aborted) {
       const abortReason = requestOptions?.abortSignal?.reason;
       throw new Error(
@@ -458,6 +479,7 @@ export async function* streamOpencodeSession(
     yield* textBlocks.drain();
     throw error;
   } finally {
+    clearTimeout(deadlineTimer);
     requestOptions?.abortSignal?.removeEventListener('abort', abortHandler);
     streamController.abort();
   }
